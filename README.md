@@ -29,6 +29,7 @@ Usage:
                        [--dir|-d] [--file|-f] [--regex|-r] [--bypass|-b]
                        [--classify|-C]
                        [--absolute-paths|-A]
+                       [--sizes]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
@@ -43,18 +44,18 @@ Arguments:
 
    Goal           | Shorthand      | Wildcard Format | Regex Format
    ---------------|----------------|-----------------|------------------
-   Contains (All) | unearth abc    | unearth "*abc*" | unearth -r "abc"
-   Contains (File)| unearth abc -f | unearth "*abc*" -f| unearth -r "abc" -f
-   Contains (Dir) | unearth abc -d | unearth "*abc*" -d| unearth -r "abc" -d
-   Exact (All)    | -              | -               | unearth -r "^abc$"
-   Exact (File)   | -              | -               | unearth -r "^abc$" -f
-   Exact (Dir)    | unearth /abc/  | -               | unearth -r "^abc$" -d
-   Starts (All)   | unearth /abc   | unearth "abc*"  | unearth -r "^abc"
-   Starts (File)  | unearth /abc -f| unearth "abc*" -f| unearth -r "^abc" -f
-   Starts (Dir)   | unearth /abc -d| unearth "abc*" -d| unearth -r "^abc" -d
-   Ends (All)     | -              | unearth "*abc"  | unearth -r "abc$"
-   Ends (File)    | -              | unearth "*abc" -f| unearth -r "abc$" -f
-   Ends (Dir)     | unearth abc/   | unearth "*abc" -d| unearth -r "abc$" -d
+   Contains (All) | abc            | "*abc*"         | -r "abc"
+   Contains (File)| abc -f         | "*abc*" -f      | -r "abc" -f
+   Contains (Dir) | abc -d         | "*abc*" -d      | -r "abc" -d
+   Exact (All)    | -              | -               | -r "^abc$"
+   Exact (File)   | -              | -               | -r "^abc$" -f
+   Exact (Dir)    | /abc/          | -               | -r "^abc$" -d
+   Starts (All)   | /abc           | "abc*"          | -r "^abc"
+   Starts (File)  | /abc -f        | "abc*" -f       | -r "^abc" -f
+   Starts (Dir)   | /abc -d        | "abc*" -d       | -r "^abc" -d
+   Ends (All)     | -              | "*abc"          | -r "abc$"
+   Ends (File)    | -              | "*abc" -f       | -r "abc$" -f
+   Ends (Dir)     | abc/           | "*abc" -d       | -r "abc$" -d
 
    <search_dir>:
       Location to search. Defaults to '.' (the current directory).
@@ -113,6 +114,15 @@ Options:
   --long, -l
       Show the date and time of last modification and size
       (B, KiB, MiB, GiB, TiB) at the start of each line.
+  --sizes
+      Show compact sizes for matching files and recursively computed sizes
+      for matching directories as: SIZE<TAB>PATH.
+      Units are B/K/M/G/T, capped to 6 characters including the unit
+      (for example 1.111M, 111.1M).
+      Recursive directory totals prefer an NTFS MFT fast path on ntfs/ntfs3/
+      fuseblk and fall back to jwalk automatically when unavailable.
+      Set UNEARTH_NTFS_DEBUG=1 to print fast-path status.
+      Symlinked directories are not traversed.
   -L, --long-true-dirsize
       Extended long output for directories:
       YYYY-MM-DD HH:MM:SS REALDIRSIZE FILECOUNT PATH

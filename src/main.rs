@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local};
+use jwalk::{Parallelism, WalkDir};
 use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -6,9 +7,9 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use rayon::prelude::*;
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 const VERSION: &str = "0.8.6";
+const NTFS_FS_TYPES: [&str; 3] = ["ntfs", "ntfs3", "fuseblk"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TypeFlag {
@@ -60,11 +62,19 @@ enum SearchDirMode {
 }
 
 #[derive(Clone, Debug)]
+struct MountInfo {
+    device: PathBuf,
+    mount_point: PathBuf,
+    fs_type: String,
+}
+
+#[derive(Clone, Debug)]
 struct Options {
     timeout_dur: Duration,
     force_pattern_mode: bool,
     long_format: bool,
     long_extended: bool,
+    sizes: bool,
     counts: bool,
     regex_mode: bool,
     sort_field: Option<SortField>,
@@ -102,6 +112,7 @@ struct DirStats {
 #[derive(Default)]
 struct DirStatsCache {
     map: HashMap<String, DirStats>,
+    bytes_map: HashMap<String, u64>,
 }
 
 struct RawCacheState {
@@ -130,6 +141,7 @@ Usage:
                        [--dir|-d] [--file|-f] [--regex|-r] [--bypass|-b]
                        [--classify|-C]
                        [--absolute-paths|-A]
+                       [--sizes]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
@@ -145,18 +157,18 @@ Arguments:
 
    Goal           | Shorthand        | Wildcard Format        | Regex Format
    ---------------|------------------|------------------------|-------------------
-   Contains (All) | unearth abc      | unearth "*abc*"        | unearth -r "abc"
-   Contains (File)| unearth abc -f   | unearth "*abc*" -f     | unearth -r "abc" -f
-   Contains (Dir) | unearth abc -d   | unearth "*abc*" -d     | unearth -r "abc" -d
-   Exact (All)    | -                | -                      | unearth -r "^abc$"
-   Exact (File)   | -                | -                      | unearth -r "^abc$" -f
-   Exact (Dir)    | unearth /abc/    | -                      | unearth -r "^abc$" -d
-   Starts (All)   | unearth /abc     | unearth "abc*"         | unearth -r "^abc"
-   Starts (File)  | unearth /abc -f  | unearth "abc*" -f      | unearth -r "^abc" -f
-   Starts (Dir)   | unearth /abc -d  | unearth "abc*" -d      | unearth -r "^abc" -d
-   Ends (All)     | -                | unearth "*abc"         | unearth -r "abc$"
-   Ends (File)    | -                | unearth "*abc" -f      | unearth -r "abc$" -f
-   Ends (Dir)     | unearth abc/     | unearth "*abc" -d      | unearth -r "abc$" -d
+   Contains (All) | abc              | "*abc*"                | -r "abc"
+   Contains (File)| abc -f           | "*abc*" -f             | -r "abc" -f
+   Contains (Dir) | abc -d           | "*abc*" -d             | -r "abc" -d
+   Exact (All)    | -                | -                      | -r "^abc$"
+   Exact (File)   | -                | -                      | -r "^abc$" -f
+   Exact (Dir)    | /abc/            | -                      | -r "^abc$" -d
+   Starts (All)   | /abc             | "abc*"                 | -r "^abc"
+   Starts (File)  | /abc -f          | "abc*" -f              | -r "^abc" -f
+   Starts (Dir)   | /abc -d          | "abc*" -d              | -r "^abc" -d
+   Ends (All)     | -                | "*abc"                 | -r "abc$"
+   Ends (File)    | -                | "*abc" -f              | -r "abc$" -f
+   Ends (Dir)     | abc/             | "*abc" -d              | -r "abc$" -d
 
    <search_dir>:
       Location to search. Defaults to '.' (the current directory).
@@ -192,6 +204,12 @@ Arguments:
 Notes:
   - Use quotes around patterns containing $ or * to prevent shell expansion.
   - Regex mode is only enabled with --regex/-r.
+  - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
+    unit, e.g., 1.111M, 111.1M),
+    using recursive directory totals for directory matches.
+  - On NTFS-like filesystems (ntfs, ntfs3, fuseblk), recursive directory size
+    scans attempt an MFT fast path and fall back automatically.
+    Set UNEARTH_NTFS_DEBUG=1 to print fast-path status.
   - Plain patterns are contains. For exact matches use regex anchors
     (e.g., --regex "^word$"), or /word/ for exact-directory shorthand.
 "#;
@@ -217,6 +235,7 @@ fn parse_args() -> Result<Options, String> {
         force_pattern_mode: false,
         long_format: false,
         long_extended: false,
+        sizes: false,
         counts: false,
         regex_mode: false,
         sort_field: None,
@@ -386,6 +405,7 @@ fn parse_args() -> Result<Options, String> {
             "--cache" => return Err("--cache was renamed to --cache-raw".to_string()),
             "--bypass" | "-b" => opts.force_pattern_mode = true,
             "--long" | "-l" => opts.long_format = true,
+            "--sizes" => opts.sizes = true,
             "-L" | "--long-true-dirsize" => {
                 opts.long_format = true;
                 opts.long_extended = true;
@@ -440,6 +460,7 @@ fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
         && !opts.counts
         && opts.sort_field.is_none()
         && !opts.long_format
+        && !opts.sizes
         && !opts.absolute_paths
 }
 
@@ -901,31 +922,310 @@ fn walk_rayon_worker(
         });
 }
 
-fn get_dir_stats_native(path: &str) -> (u64, u64) {
-    let bytes = Arc::new(AtomicU64::new(0));
-    let files = Arc::new(AtomicU64::new(0));
-    let tx_bytes = Arc::clone(&bytes);
-    let tx_files = Arc::clone(&files);
-    fn walk(p: PathBuf, b: &Arc<AtomicU64>, f: &Arc<AtomicU64>) {
-        let Ok(read_dir) = fs::read_dir(p) else {
-            return;
-        };
-        let mut dirs = Vec::new();
-        for entry in read_dir.filter_map(|e| e.ok()) {
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_file() {
-                if let Ok(m) = entry.metadata() {
-                    b.fetch_add(m.len(), Ordering::Relaxed);
-                }
-                f.fetch_add(1, Ordering::Relaxed);
-            } else if ft.is_dir() {
-                dirs.push(entry.path());
+fn unescape_proc_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let a = bytes[i + 1];
+            let b = bytes[i + 2];
+            let c = bytes[i + 3];
+            let octal = (b'0'..=b'7').contains(&a)
+                && (b'0'..=b'7').contains(&b)
+                && (b'0'..=b'7').contains(&c);
+            if octal {
+                let value = ((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0');
+                out.push(value);
+                i += 4;
+                continue;
             }
         }
-        dirs.into_par_iter().for_each(|d| walk(d, b, f));
+        out.push(bytes[i]);
+        i += 1;
     }
-    walk(PathBuf::from(path), &tx_bytes, &tx_files);
-    (bytes.load(Ordering::Relaxed), files.load(Ordering::Relaxed))
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn detect_mount_info(path: &Path) -> Option<MountInfo> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    let mut best: Option<(usize, MountInfo)> = None;
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let (device_raw, mount_point_raw, fs_type) =
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(device), Some(mount), Some(fs_type)) => (device, mount, fs_type),
+                _ => continue,
+            };
+        let device = PathBuf::from(unescape_proc_mount_field(device_raw));
+        let mount_point = PathBuf::from(unescape_proc_mount_field(mount_point_raw));
+        if !canonical.starts_with(&mount_point) {
+            continue;
+        }
+        let mount_len = mount_point.as_os_str().as_bytes().len();
+        if best
+            .as_ref()
+            .map(|(best_len, _)| mount_len > *best_len)
+            .unwrap_or(true)
+        {
+            best = Some((
+                mount_len,
+                MountInfo {
+                    device,
+                    mount_point,
+                    fs_type: fs_type.to_string(),
+                },
+            ));
+        }
+    }
+    best.map(|(_, info)| info)
+}
+
+fn ntfs_best_filename(
+    entry: &ntfs::NtfsIndexEntry<'_, ntfs::indexes::NtfsFileNameIndex>,
+) -> Option<String> {
+    if let Some(Ok(file_name)) = entry.key() {
+        let name = file_name.name().to_string_lossy().to_string();
+        if !name.contains('~') || name.len() > 12 {
+            return Some(name);
+        }
+    }
+    entry
+        .key()
+        .and_then(|result| result.ok())
+        .map(|file_name| file_name.name().to_string_lossy().to_string())
+}
+
+fn ntfs_is_reparse_point(file: &ntfs::NtfsFile, device: &mut fs::File) -> bool {
+    let mut attrs = file.attributes();
+    while let Some(attr_result) = attrs.next(device) {
+        if let Ok(attr_item) = attr_result {
+            if let Ok(attr) = attr_item.to_attribute() {
+                if let Ok(attr_ty) = attr.ty() {
+                    if attr_ty == ntfs::NtfsAttributeType::ReparsePoint {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn ntfs_file_logical_size(file: &ntfs::NtfsFile, device: &mut fs::File) -> u64 {
+    if let Some(data_attr) = file.data(device, "") {
+        if let Ok(data_item) = data_attr {
+            if let Ok(data_attr_obj) = data_item.to_attribute() {
+                if let Ok(value) = data_attr_obj.value(device) {
+                    return value.len();
+                }
+            }
+        }
+    }
+    0
+}
+
+fn ntfs_find_subdir_record(
+    ntfs: &ntfs::Ntfs,
+    device: &mut fs::File,
+    start_record: u64,
+    rel_path: &Path,
+) -> Option<u64> {
+    let mut current_record = start_record;
+    if rel_path.as_os_str().is_empty() {
+        return Some(current_record);
+    }
+    for component in rel_path.components() {
+        let name = match component {
+            Component::Normal(name) => name.to_string_lossy().to_string(),
+            _ => continue,
+        };
+        let dir_file = ntfs.file(device, current_record).ok()?;
+        let index = dir_file.directory_index(device).ok()?;
+        let mut entries = index.entries();
+        let mut seen_records = HashSet::<u64>::new();
+        let mut next_record: Option<u64> = None;
+        while let Some(entry_result) = entries.next(device) {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let entry_name = match ntfs_best_filename(&entry) {
+                Some(n) => n,
+                None => continue,
+            };
+            if entry_name == "." || entry_name == ".." {
+                continue;
+            }
+            let child_record = entry.file_reference().file_record_number();
+            if !seen_records.insert(child_record) {
+                continue;
+            }
+            if entry_name == name {
+                next_record = Some(child_record);
+                break;
+            }
+        }
+        current_record = next_record?;
+    }
+    Some(current_record)
+}
+
+fn ntfs_scan_subtree_record(
+    ntfs: &ntfs::Ntfs,
+    device: &mut fs::File,
+    top_record: u64,
+    count_files: bool,
+) -> (u64, u64) {
+    let mut total_size = 0u64;
+    let mut total_files = 0u64;
+    let mut stack = vec![top_record];
+    let mut seen_dirs = HashSet::<u64>::new();
+    while let Some(current_record) = stack.pop() {
+        if !seen_dirs.insert(current_record) {
+            continue;
+        }
+        let dir_file = match ntfs.file(device, current_record) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        let index = match dir_file.directory_index(device) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let mut entries = index.entries();
+        let mut seen_records = HashSet::<u64>::new();
+        while let Some(entry_result) = entries.next(device) {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let name = match ntfs_best_filename(&entry) {
+                Some(n) => n,
+                None => continue,
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child_record = entry.file_reference().file_record_number();
+            if !seen_records.insert(child_record) {
+                continue;
+            }
+            let child_file = match ntfs.file(device, child_record) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let child_is_dir = child_file.is_directory();
+            let child_is_reparse = ntfs_is_reparse_point(&child_file, device);
+            if child_is_dir && !child_is_reparse {
+                stack.push(child_record);
+            } else if !child_is_reparse {
+                total_size = total_size.saturating_add(ntfs_file_logical_size(&child_file, device));
+                if count_files {
+                    total_files = total_files.saturating_add(1);
+                }
+            }
+        }
+    }
+    (total_size, total_files)
+}
+
+fn get_dir_stats_ntfs_mft(path: &Path, count_files: bool) -> io::Result<(u64, u64)> {
+    let canonical_base = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mount = detect_mount_info(&canonical_base)
+        .ok_or_else(|| io::Error::other("mount detection failed"))?;
+    if !NTFS_FS_TYPES.iter().any(|t| mount.fs_type == *t) {
+        return Err(io::Error::other("not ntfs"));
+    }
+    let mut device = fs::File::open(&mount.device)?;
+    let ntfs = ntfs::Ntfs::new(&mut device).map_err(|err| io::Error::other(err.to_string()))?;
+    let root_dir = ntfs
+        .root_directory(&mut device)
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let root_record = root_dir.file_record_number();
+    let rel_path = canonical_base
+        .strip_prefix(&mount.mount_point)
+        .unwrap_or(Path::new(""));
+    let base_record = ntfs_find_subdir_record(&ntfs, &mut device, root_record, rel_path)
+        .ok_or_else(|| io::Error::other("base directory not found in mft"))?;
+    Ok(ntfs_scan_subtree_record(
+        &ntfs,
+        &mut device,
+        base_record,
+        count_files,
+    ))
+}
+
+fn get_dir_stats_walk(path: &str, count_files: bool) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for entry_res in WalkDir::new(path).follow_links(false) {
+        let Ok(entry) = entry_res else { continue };
+        let file_type = entry.file_type();
+        if !file_type.is_file() {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            bytes = bytes.saturating_add(meta.len());
+        }
+        if count_files {
+            files = files.saturating_add(1);
+        }
+    }
+    (bytes, files)
+}
+
+fn get_dir_stats_native(path: &str, count_files: bool) -> (u64, u64) {
+    let path_buf = PathBuf::from(path);
+    let ntfs_debug = env::var_os("UNEARTH_NTFS_DEBUG").is_some();
+    match get_dir_stats_ntfs_mft(&path_buf, count_files) {
+        Ok(stats) => {
+            if ntfs_debug {
+                eprintln!("unearth: NTFS MFT fast path enabled for {}", path);
+            }
+            stats
+        }
+        Err(err) => {
+            if ntfs_debug
+                && detect_mount_info(&path_buf)
+                    .as_ref()
+                    .map(|m| NTFS_FS_TYPES.iter().any(|t| m.fs_type == *t))
+                    .unwrap_or(false)
+            {
+                eprintln!("unearth: NTFS MFT fast path unavailable for {}: {}", path, err);
+            }
+            get_dir_stats_walk(path, count_files)
+        }
+    }
+}
+
+fn get_dir_bytes_native_serial(path: &str) -> u64 {
+    if let Ok((bytes, _)) = get_dir_stats_ntfs_mft(Path::new(path), false) {
+        return bytes;
+    }
+    let mut bytes = 0u64;
+    for entry_res in WalkDir::new(path)
+        .follow_links(false)
+        .parallelism(Parallelism::Serial)
+    {
+        let Ok(entry) = entry_res else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            bytes = bytes.saturating_add(meta.len());
+        }
+    }
+    bytes
+}
+
+fn normalize_dir_key(path: &str) -> String {
+    if path == "/" {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
 }
 
 fn format_size_iec(bytes: u64) -> String {
@@ -944,6 +1244,84 @@ fn format_size_iec(bytes: u64) -> String {
         format!("{:.1} {}", size, units[unit])
     } else {
         format!("{:.2} {}", size, units[unit])
+    }
+}
+
+fn format_size_compact_3(bytes: u64) -> String {
+    let units = ["B", "K", "M", "G", "T"];
+    let mut unit = 0usize;
+    let mut size = bytes as f64;
+    while size >= 1024.0 && unit < units.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}{}", bytes, units[unit])
+    } else {
+        let decimals = if size >= 1000.0 {
+            0
+        } else if size >= 100.0 {
+            1
+        } else if size >= 10.0 {
+            2
+        } else {
+            3
+        };
+        let factor = 10f64.powi(decimals as i32);
+        let truncated = (size * factor).floor() / factor;
+        format!("{:.*}{}", decimals, truncated, units[unit])
+    }
+}
+
+fn should_use_recursive_dirsize(item: &SearchResult, opts: &Options) -> bool {
+    if !item.is_dir || item.is_symlink {
+        return false;
+    }
+    opts.sizes || opts.long_extended || !opts.no_recurse
+}
+
+fn size_bytes_for_result(item: &SearchResult, opts: &Options, cache: &mut DirStatsCache) -> u64 {
+    if should_use_recursive_dirsize(item, opts) {
+        return get_dirsize_bytes(&item.path, cache).unwrap_or(0);
+    }
+    item.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+}
+
+fn precompute_dirsize_cache(items: &[SearchResult], opts: &Options, cache: &mut DirStatsCache) {
+    let need_recursive = opts.sizes
+        || opts.long_extended
+        || matches!(opts.sort_field, Some(SortField::Size) if !opts.no_recurse);
+    if !need_recursive {
+        return;
+    }
+    let mut needed_dirs: Vec<String> = items
+        .iter()
+        .filter(|item| should_use_recursive_dirsize(item, opts))
+        .map(|item| normalize_dir_key(&item.path))
+        .collect();
+    needed_dirs.sort();
+    needed_dirs.dedup();
+    if opts.long_extended {
+        for dir in needed_dirs {
+            let _ = get_dirsize_stats(&dir, cache);
+        }
+    } else {
+        let mut missing = Vec::new();
+        for dir in needed_dirs {
+            if !cache.bytes_map.contains_key(&dir) && !cache.map.contains_key(&dir) {
+                missing.push(dir);
+            }
+        }
+        let computed: Vec<(String, u64)> = missing
+            .into_par_iter()
+            .map(|dir| {
+                let bytes = get_dir_bytes_native_serial(&dir);
+                (dir, bytes)
+            })
+            .collect();
+        for (dir, bytes) in computed {
+            cache.bytes_map.insert(dir, bytes);
+        }
     }
 }
 
@@ -976,44 +1354,8 @@ fn sort_results(
                 da.cmp(&db)
             }
             SortField::Size => {
-                let sa = if a.is_dir {
-                    if opts.long_extended {
-                        if a.is_symlink {
-                            a.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                        } else {
-                            get_dirsize_stats(&a.path, cache)
-                                .map(|s| s.bytes)
-                                .unwrap_or(0)
-                        }
-                    } else if opts.no_recurse {
-                        a.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                    } else {
-                        get_dirsize_stats(&a.path, cache)
-                            .map(|s| s.bytes)
-                            .unwrap_or(0)
-                    }
-                } else {
-                    a.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                };
-                let sb = if b.is_dir {
-                    if opts.long_extended {
-                        if b.is_symlink {
-                            b.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                        } else {
-                            get_dirsize_stats(&b.path, cache)
-                                .map(|s| s.bytes)
-                                .unwrap_or(0)
-                        }
-                    } else if opts.no_recurse {
-                        b.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                    } else {
-                        get_dirsize_stats(&b.path, cache)
-                            .map(|s| s.bytes)
-                            .unwrap_or(0)
-                    }
-                } else {
-                    b.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
-                };
+                let sa = size_bytes_for_result(a, opts, cache);
+                let sb = size_bytes_for_result(b, opts, cache);
                 sa.cmp(&sb)
             }
             SortField::Name => a.path.to_lowercase().cmp(&b.path.to_lowercase()),
@@ -1131,17 +1473,35 @@ fn cache_transform(items: &Vec<SearchResult>, opts: &Options) {
 }
 
 fn get_dirsize_stats(path: &str, cache: &mut DirStatsCache) -> Option<DirStats> {
-    if let Some(v) = cache.map.get(path) {
+    let key = normalize_dir_key(path);
+    let walk_path = if key == "/" { "/" } else { key.as_str() };
+    if let Some(v) = cache.map.get(&key) {
         return Some(v.clone());
     }
-    let (bytes, files) = get_dir_stats_native(path);
+    let (bytes, files) = get_dir_stats_native(walk_path, true);
     let stats = DirStats {
         files,
         bytes,
         human: format_size_iec(bytes),
     };
-    cache.map.insert(path.to_string(), stats.clone());
+    cache.bytes_map.insert(key.clone(), bytes);
+    cache.map.insert(key, stats.clone());
     Some(stats)
+}
+
+fn get_dirsize_bytes(path: &str, cache: &mut DirStatsCache) -> Option<u64> {
+    let key = normalize_dir_key(path);
+    let walk_path = if key == "/" { "/" } else { key.as_str() };
+    if let Some(v) = cache.bytes_map.get(&key) {
+        return Some(*v);
+    }
+    if let Some(v) = cache.map.get(&key) {
+        cache.bytes_map.insert(key.clone(), v.bytes);
+        return Some(v.bytes);
+    }
+    let (bytes, _) = get_dir_stats_native(walk_path, false);
+    cache.bytes_map.insert(key, bytes);
+    Some(bytes)
 }
 
 fn add_info_transform(
@@ -1187,6 +1547,24 @@ fn add_info_transform(
         } else {
             out.push(item.path);
         }
+    }
+    out
+}
+
+fn sizes_transform(
+    items: Vec<SearchResult>,
+    opts: &Options,
+    cache: &mut DirStatsCache,
+    use_style: bool,
+    add_decorator: bool,
+    colors: &ColorSpec,
+) -> Vec<String> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let bytes = size_bytes_for_result(&item, opts, cache);
+        let compact = format_size_compact_3(bytes);
+        let path_display = render_styled_path(&item, use_style, add_decorator, colors, opts);
+        out.push(format!("{}\t{}", compact, path_display));
     }
     out
 }
@@ -1425,7 +1803,11 @@ fn final_transform(
     if opts.counts {
         return counts_summary_transform(items, use_style);
     }
+    precompute_dirsize_cache(&items, opts, cache);
     let items = sort_results(items, opts, cache);
+    if opts.sizes {
+        return sizes_transform(items, opts, cache, use_style, add_decorators, colors);
+    }
     let mut out = Vec::new();
     if opts.long_format {
         for item_str in add_info_transform(items, opts, cache, use_style, add_decorators, colors) {
@@ -1586,7 +1968,7 @@ fn run_standard(
     }
 
     let mut results = Vec::new();
-    let needs_metadata = opts.long_format || opts.sort_field.is_some();
+    let needs_metadata = opts.long_format || opts.sort_field.is_some() || opts.sizes;
     let (tx, rx) = unbounded::<Vec<SearchResult>>();
     let opts_clone = opts.clone();
     if opts.positional.len() == 1 {
@@ -1732,7 +2114,7 @@ fn run_full(
             &opts_clone,
             type_flag,
             true,
-            opts_clone.long_format || opts_clone.sort_field.is_some(),
+            opts_clone.long_format || opts_clone.sort_field.is_some() || opts_clone.sizes,
             &timeout_triggered,
         );
     });
@@ -1783,6 +2165,7 @@ fn main() -> ExitCode {
     };
     let mut cache = DirStatsCache {
         map: HashMap::new(),
+        bytes_map: HashMap::new(),
     };
     let colors = if opts.color_when == ColorWhen::Never {
         default_color_spec()

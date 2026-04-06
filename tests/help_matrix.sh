@@ -207,6 +207,23 @@ dd if=/dev/zero of="${SIZE_DIR_ROOT}/small_dir/tiny" bs=1024 count=1 status=none
 want_size_dir_desc=$'big_dir/\nsmall_dir/'
 assert_eq "sort size desc dirs" "$(list_rel_raw "$SIZE_DIR_ROOT" --sort size desc -d '*')" "$want_size_dir_desc"
 
+# SIZES MATRIX: compact display values
+SIZES_DIR_ROOT="${TMP_BASE}/sizes_dir_root"
+mkdir -p "${SIZES_DIR_ROOT}/big_dir" "${SIZES_DIR_ROOT}/small_dir"
+dd if=/dev/zero of="${SIZES_DIR_ROOT}/big_dir/blob" bs=1024 count=2 status=none
+dd if=/dev/zero of="${SIZES_DIR_ROOT}/small_dir/tiny" bs=1024 count=1 status=none
+sizes_dir_desc="$("$F" --timeout "$F_TIMEOUT" --sizes --sort size desc -d '*' "$SIZES_DIR_ROOT" 2>/dev/null | sed "s#\t${SIZES_DIR_ROOT}/#\t#")"
+want_sizes_dir_desc=$'2.000K\tbig_dir/\n1.000K\tsmall_dir/'
+assert_eq "sizes reports recursive dir values" "$sizes_dir_desc" "$want_sizes_dir_desc"
+
+SIZES_FILE_ROOT="${TMP_BASE}/sizes_file_root"
+mkdir -p "$SIZES_FILE_ROOT"
+dd if=/dev/zero of="${SIZES_FILE_ROOT}/large.bin" bs=1 count=512 status=none
+dd if=/dev/zero of="${SIZES_FILE_ROOT}/small.bin" bs=1 count=128 status=none
+sizes_file_desc="$("$F" --timeout "$F_TIMEOUT" --sizes --sort size desc -f '*' "$SIZES_FILE_ROOT" 2>/dev/null | sed "s#\t${SIZES_FILE_ROOT}/#\t#")"
+want_sizes_file_desc=$'512B\tlarge.bin\n128B\tsmall.bin'
+assert_eq "sizes reports file values" "$sizes_file_desc" "$want_sizes_file_desc"
+
 # SORT MATRIX: name
 NAME_ROOT="${TMP_BASE}/name_root"
 mkdir -p "$NAME_ROOT"
