@@ -30,6 +30,8 @@ Usage:
                        [--classify|-C]
                        [--absolute-paths|-A]
                        [--sizes]
+                       [--contains-all]
+                       [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
@@ -88,6 +90,14 @@ Arguments:
 Notes:
   - Use quotes around patterns containing $ or * to prevent shell expansion.
   - Regex mode is only enabled with --regex/-r.
+  - Name contains-all mode is implicit when 3+ positional terms are provided,
+    or enabled with --contains-all:
+    `unearth WORD1 WORD2 [WORD3 ...] [PATH]`
+    It finds filenames/paths containing all words in any order.
+    PATH is implicit only if last arg is absolute (`/x`), explicit relative
+    (`./x`, `../x`, `~/x`), or contains a slash (`a/b`).
+    A bare token like `folder1` is treated as a search term unless
+    `--path folder1` is used.
   - Plain patterns are contains. For exact matches use regex anchors
     (e.g., --regex "^word$"), or /word/ for exact-directory shorthand.
 
@@ -123,6 +133,14 @@ Options:
       fuseblk and fall back to jwalk automatically when unavailable.
       Set UNEARTH_NTFS_DEBUG=1 to print fast-path status.
       Symlinked directories are not traversed.
+  --contains-all
+      Force name contains-all mode even with fewer than 3 positional words.
+      Positional args are treated as required name/path terms, with an optional
+      trailing PATH (implicit only for `/x`, `./x`, `../x`, `~/x`, or `a/b`).
+  --path DIR
+      Set a literal search root for contains-all name matching mode.
+      This allows bare relative directories like `folder1` to be treated as
+      path roots instead of search terms.
   -L, --long-true-dirsize
       Extended long output for directories:
       YYYY-MM-DD HH:MM:SS REALDIRSIZE FILECOUNT PATH

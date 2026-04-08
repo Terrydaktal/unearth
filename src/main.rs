@@ -92,6 +92,8 @@ struct Options {
     classify: bool,
     color_when: ColorWhen,
     hyperlinks: bool,
+    contains_all: bool,
+    path_override: Option<String>,
     positional: Vec<String>,
 }
 
@@ -100,6 +102,12 @@ struct SearchResult {
     is_dir: bool,
     is_symlink: bool,
     metadata: Option<fs::Metadata>,
+}
+
+#[derive(Clone, Debug)]
+struct ContainsAllSpec {
+    terms: Vec<String>,
+    root: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +150,8 @@ Usage:
                        [--classify|-C]
                        [--absolute-paths|-A]
                        [--sizes]
+                       [--contains-all]
+                       [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
@@ -201,12 +211,19 @@ Arguments:
    Example: unearth --full "test"         # Returns /path/to/test, but hides
    /path/to/test/file
 
-Notes:
+   Notes:
   - Use quotes around patterns containing $ or * to prevent shell expansion.
   - Regex mode is only enabled with --regex/-r.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
+  - Name contains-all mode is implicit with 3+ positional terms, or enabled by
+    --contains-all:
+    unearth WORD1 WORD2 [WORD3 ...] [PATH]
+    It finds filenames/paths containing all words in any order.
+    PATH is implicit only if the last arg is absolute (/x), explicit relative
+    (./x, ../x, ~/x), or contains a slash (a/b). A bare token like "folder1"
+    is treated as a word unless --path folder1 is used.
   - On NTFS-like filesystems (ntfs, ntfs3, fuseblk), recursive directory size
     scans attempt an MFT fast path and fall back automatically.
     Set UNEARTH_NTFS_DEBUG=1 to print fast-path status.
@@ -253,6 +270,8 @@ fn parse_args() -> Result<Options, String> {
         classify: false,
         color_when: ColorWhen::Auto,
         hyperlinks: false,
+        contains_all: false,
+        path_override: None,
         positional: Vec::new(),
     };
 
@@ -373,6 +392,22 @@ fn parse_args() -> Result<Options, String> {
                 opts.color_when = parse_color_when(arg.trim_start_matches("--color="))?;
             }
             "--hyperlink" => opts.hyperlinks = true,
+            "--contains-all" => opts.contains_all = true,
+            "--path" => {
+                i += 1;
+                if i < args.len() {
+                    opts.path_override = Some(args[i].clone());
+                } else {
+                    return Err("--path requires a directory argument".to_string());
+                }
+            }
+            _ if arg.starts_with("--path=") => {
+                let v = arg.trim_start_matches("--path=").to_string();
+                if v.is_empty() {
+                    return Err("--path requires a non-empty directory argument".to_string());
+                }
+                opts.path_override = Some(v);
+            }
             "--dir" | "-d" => opts.force_dir = true,
             "--file" | "-f" => opts.force_file = true,
             "--full" | "-F" => opts.force_full = true,
@@ -618,6 +653,66 @@ fn parse_search_dir(raw: &str, regex_mode: bool, force_pattern_mode: bool) -> Se
         return SearchDirMode::Pattern(wildcard_to_regex(&normalized));
     }
     SearchDirMode::Pattern(to_regex_fragment(&normalized))
+}
+
+fn expand_home_path(raw: &str) -> String {
+    if raw == "~" {
+        return env::var("HOME").unwrap_or_else(|_| raw.to_string());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    raw.to_string()
+}
+
+fn is_implicit_content_path_token(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with("~/")
+        || raw.contains('/')
+}
+
+fn resolve_literal_search_root(raw: &str) -> Result<PathBuf, String> {
+    let expanded = expand_home_path(raw);
+    let path = PathBuf::from(expanded);
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(format!("--path target '{}' is not an existing directory", raw))
+    }
+}
+
+fn contains_all_spec_from_opts(opts: &Options) -> Result<Option<ContainsAllSpec>, String> {
+    let implicit_by_terms = opts.positional.len() >= 3;
+    let forced_by_flags = opts.contains_all || opts.path_override.is_some();
+    if opts.force_full && !forced_by_flags {
+        return Ok(None);
+    }
+    if !(forced_by_flags || implicit_by_terms) {
+        return Ok(None);
+    }
+    let mut terms = opts.positional.clone();
+    let mut root_raw = opts.path_override.clone();
+    if root_raw.is_none() && !terms.is_empty() {
+        if let Some(last) = terms.last() {
+            if is_implicit_content_path_token(last) {
+                root_raw = Some(last.clone());
+                terms.pop();
+            }
+        }
+    }
+    if terms.is_empty() {
+        return Err("contains-all mode requires at least one search term".to_string());
+    }
+    let root = if let Some(raw) = root_raw {
+        resolve_literal_search_root(&raw)?
+    } else {
+        PathBuf::from(".")
+    };
+    Ok(Some(ContainsAllSpec { terms, root }))
 }
 
 struct PathInfo {
@@ -2056,6 +2151,109 @@ fn run_standard(
     ))
 }
 
+fn run_contains_all(
+    opts: &Options,
+    spec: ContainsAllSpec,
+    cache: &mut DirStatsCache,
+    colors: &ColorSpec,
+) -> Result<Vec<String>, String> {
+    let stdout_is_tty = io::stdout().is_terminal();
+    let use_style = style_enabled(opts, stdout_is_tty);
+    let timeout_dur = opts.timeout_dur;
+    let timeout_triggered = Arc::new(AtomicBool::new(false));
+    let timeout_clone = timeout_triggered.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout_dur);
+        timeout_clone.store(true, Ordering::Relaxed);
+    });
+
+    let mut type_flag = if opts.force_dir {
+        Some(TypeFlag::Dir)
+    } else if opts.force_file {
+        Some(TypeFlag::File)
+    } else {
+        None
+    };
+    let mut regexes = Vec::new();
+    for p in &spec.terms {
+        let parsed = parse_name_pattern(p, opts.regex_mode);
+        if parsed.type_flag == Some(TypeFlag::Dir) && !opts.force_file {
+            type_flag = Some(TypeFlag::Dir);
+        }
+        regexes.push(parsed.regex);
+    }
+    if regexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let first_re = RegexBuilder::new(&regexes[0])
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| format!("Invalid regex: {}", e))?;
+    let is_catch_all = regexes[0] == ".*" || regexes[0] == "^.*$";
+    let needs_metadata = opts.long_format || opts.sort_field.is_some() || opts.sizes;
+    let (tx, rx) = unbounded::<Vec<SearchResult>>();
+    let opts_clone = opts.clone();
+    let root = spec.root.clone();
+    rayon::spawn(move || {
+        walk_rayon_worker(
+            root,
+            &first_re,
+            is_catch_all,
+            &tx,
+            &opts_clone,
+            type_flag,
+            opts_clone.force_full,
+            needs_metadata,
+            &timeout_triggered,
+        )
+    });
+
+    let mut rows = Vec::new();
+    for chunk in rx {
+        rows.extend(chunk);
+    }
+    for rx_str in regexes.iter().skip(1) {
+        let re_extra = RegexBuilder::new(rx_str)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| format!("Invalid regex: {}", e))?;
+        rows = rows
+            .into_iter()
+            .filter(|r| {
+                if opts.force_full {
+                    re_extra.is_match(&r.path)
+                } else {
+                    let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                    re_extra.is_match(base)
+                }
+            })
+            .collect();
+    }
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    if opts.force_full {
+        let mut pruned = Vec::new();
+        let mut last = String::new();
+        for r in rows {
+            let p = r.path.trim_end_matches('/');
+            if !last.is_empty() && p.starts_with(&format!("{}/", last)) {
+                continue;
+            }
+            last = p.to_string();
+            pruned.push(r);
+        }
+        rows = pruned;
+    }
+
+    Ok(final_transform(
+        rows,
+        opts,
+        use_style,
+        stdout_is_tty,
+        colors,
+        cache,
+    ))
+}
+
 fn run_full(
     opts: &Options,
     cache: &mut DirStatsCache,
@@ -2163,6 +2361,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let content_spec = match contains_all_spec_from_opts(&opts) {
+        Ok(v) => v,
+        Err(e) => {
+            if !e.trim().is_empty() {
+                eprintln!("{}", e.trim());
+            }
+            return ExitCode::from(2);
+        }
+    };
     let mut cache = DirStatsCache {
         map: HashMap::new(),
         bytes_map: HashMap::new(),
@@ -2172,7 +2379,9 @@ fn main() -> ExitCode {
     } else {
         parse_ls_colors()
     };
-    let result = if opts.force_full {
+    let result = if let Some(spec) = content_spec {
+        run_contains_all(&opts, spec, &mut cache, &colors)
+    } else if opts.force_full {
         run_full(&opts, &mut cache, &colors)
     } else {
         run_standard(&opts, &mut cache, &colors)
