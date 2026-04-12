@@ -363,11 +363,16 @@ mkdir -p "${CONTENT_ROOT}/folder1" "${CONTENT_ROOT}/relroot/inner"
 touch "${CONTENT_ROOT}/folder1/alpha_beta_doc.txt"
 touch "${CONTENT_ROOT}/relroot/inner/alpha_beta_gamma_hit.txt"
 touch "${CONTENT_ROOT}/relroot/inner/alpha_only_miss.txt"
+mkdir -p "${CONTENT_ROOT}/alpha_beta"
+touch "${CONTENT_ROOT}/alpha_beta/alpha_beta_note.txt"
 
 assert_eq "contains-all names with explicit absolute path arg" "$(list_rel "$CONTENT_ROOT" alpha beta gamma)" "relroot/inner/alpha_beta_gamma_hit.txt"
 assert_eq "contains-all names with implicit relative path arg containing slash" "$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" alpha beta gamma relroot/inner 2>/dev/null | sort)" "relroot/inner/alpha_beta_gamma_hit.txt"
+assert_eq "contains-all names implicit mode works with two terms" "$(list_rel "$CONTENT_ROOT" alpha beta)" $'alpha_beta/\nalpha_beta/alpha_beta_note.txt\nfolder1/alpha_beta_doc.txt\nrelroot/inner/alpha_beta_gamma_hit.txt'
 assert_eq "contains-all names treat bare folder token as search term" "$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" alpha beta folder1 2>/dev/null | sort)" ""
 assert_eq "contains-all names --path enables bare relative folder path" "$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" alpha beta --path folder1 2>/dev/null | sort)" "folder1/alpha_beta_doc.txt"
 assert_eq "contains-all flag forces name mode for two terms" "$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" --contains-all alpha beta --path folder1 2>/dev/null | sort)" "folder1/alpha_beta_doc.txt"
+contains_full_out="$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" -F alpha beta 2>/dev/null | sort)"
+assert_contains "contains-all -F keeps file under matching directory" "$contains_full_out" "alpha_beta/alpha_beta_note.txt"
 
 echo "PASS: help matrix suite"

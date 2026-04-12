@@ -217,8 +217,9 @@ Arguments:
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
-  - Name contains-all mode is implicit with 3+ positional terms, or enabled by
-    --contains-all:
+  - Name contains-all mode is implicit with 2+ plain positional terms
+    (legacy name+search_dir selector forms still use search_dir mode),
+    or enabled by --contains-all:
     unearth WORD1 WORD2 [WORD3 ...] [PATH]
     It finds filenames/paths containing all words in any order.
     PATH is implicit only if the last arg is absolute (/x), explicit relative
@@ -675,6 +676,22 @@ fn is_implicit_content_path_token(raw: &str) -> bool {
         || raw.contains('/')
 }
 
+fn is_explicit_search_dir_selector(raw: &str) -> bool {
+    if is_wrapped_quote(raw) {
+        return true;
+    }
+    if raw.contains('*') {
+        return true;
+    }
+    if (raw.starts_with('/') || raw.starts_with("./")) && raw.ends_with('/') {
+        return true;
+    }
+    if raw.starts_with('/') || raw.starts_with("./") {
+        return true;
+    }
+    raw != "/" && raw.ends_with('/')
+}
+
 fn resolve_literal_search_root(raw: &str) -> Result<PathBuf, String> {
     let expanded = expand_home_path(raw);
     let path = PathBuf::from(expanded);
@@ -686,9 +703,20 @@ fn resolve_literal_search_root(raw: &str) -> Result<PathBuf, String> {
 }
 
 fn contains_all_spec_from_opts(opts: &Options) -> Result<Option<ContainsAllSpec>, String> {
-    let implicit_by_terms = opts.positional.len() >= 3;
+    let implicit_by_terms = if opts.positional.len() >= 3 {
+        true
+    } else if opts.positional.len() == 2 {
+        let first = &opts.positional[0];
+        let second = &opts.positional[1];
+        !opts.regex_mode
+            && !opts.force_pattern_mode
+            && !is_wrapped_quote(first)
+            && !is_explicit_search_dir_selector(second)
+    } else {
+        false
+    };
     let forced_by_flags = opts.contains_all || opts.path_override.is_some();
-    if opts.force_full && !forced_by_flags {
+    if opts.force_full && !forced_by_flags && !implicit_by_terms {
         return Ok(None);
     }
     if !(forced_by_flags || implicit_by_terms) {
@@ -2230,19 +2258,6 @@ fn run_contains_all(
             .collect();
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
-    if opts.force_full {
-        let mut pruned = Vec::new();
-        let mut last = String::new();
-        for r in rows {
-            let p = r.path.trim_end_matches('/');
-            if !last.is_empty() && p.starts_with(&format!("{}/", last)) {
-                continue;
-            }
-            last = p.to_string();
-            pruned.push(r);
-        }
-        rows = pruned;
-    }
 
     Ok(final_transform(
         rows,

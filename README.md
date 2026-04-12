@@ -90,7 +90,8 @@ Arguments:
 Notes:
   - Use quotes around patterns containing $ or * to prevent shell expansion.
   - Regex mode is only enabled with --regex/-r.
-  - Name contains-all mode is implicit when 3+ positional terms are provided,
+  - Name contains-all mode is implicit when 2+ plain positional terms are
+    provided (legacy name+search_dir selector forms still use search_dir mode),
     or enabled with --contains-all:
     `unearth WORD1 WORD2 [WORD3 ...] [PATH]`
     It finds filenames/paths containing all words in any order.
