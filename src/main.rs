@@ -584,6 +584,62 @@ fn parse_name_pattern(raw: &str, regex_mode: bool) -> NamePattern {
     out
 }
 
+fn term_selectivity_score(raw: &str, regex_mode: bool) -> i64 {
+    let mut score: i64 = 0;
+    let core = if is_wrapped_quote(raw) && raw.len() >= 2 {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let meaningful_len = core
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .count() as i64;
+    score += meaningful_len * 24;
+
+    if regex_mode {
+        if raw.starts_with('^') {
+            score += 1200;
+        }
+        if raw.ends_with('$') {
+            score += 1200;
+        }
+        if raw.contains(".*") || raw.contains(".+") {
+            score -= 900;
+        }
+        if raw.contains('|') {
+            score -= 600;
+        }
+        let heavy_meta = raw
+            .chars()
+            .filter(|c| matches!(c, '[' | ']' | '(' | ')' | '{' | '}' | '?' | '+'))
+            .count() as i64;
+        score -= heavy_meta * 60;
+        return score;
+    }
+
+    if is_wrapped_quote(raw) {
+        score += 2200;
+    }
+    if raw.starts_with('/') && raw.ends_with('/') {
+        score += 1700;
+    } else if raw.starts_with('/') || (raw != "/" && raw.ends_with('/')) {
+        score += 900;
+    }
+
+    let stars = raw.matches('*').count() as i64;
+    if stars > 0 {
+        score -= stars * 500;
+        if raw == "*" {
+            score -= 5000;
+        }
+    } else {
+        score += 300;
+    }
+
+    score
+}
+
 fn canonical_path(raw: &str) -> Option<String> {
     let p = Path::new(raw);
     if p.is_dir() {
@@ -924,6 +980,7 @@ fn walk_rayon_worker(
     opts: &Options,
     type_flag: Option<TypeFlag>,
     full_path_match: bool,
+    prune_matched_dir_subtrees: bool,
     needs_metadata: bool,
     timeout_flag: &Arc<AtomicBool>,
 ) {
@@ -970,6 +1027,7 @@ fn walk_rayon_worker(
             Some(TypeFlag::Dir) => !is_dir,
             None => false,
         };
+        let mut matched_dir_pruned = false;
         if !skip_type {
             let is_match = if is_catch_all {
                 true
@@ -1006,9 +1064,15 @@ fn walk_rayon_worker(
                     }
                     local_buf.reserve(256);
                 }
+                if is_dir && prune_matched_dir_subtrees {
+                    matched_dir_pruned = true;
+                }
             }
         }
         if is_dir && !opts.no_recurse {
+            if matched_dir_pruned {
+                continue;
+            }
             if dir.to_str() == Some("/")
                 && (name_lossy == "proc"
                     || name_lossy == "sys"
@@ -1039,6 +1103,7 @@ fn walk_rayon_worker(
                 opts,
                 type_flag,
                 full_path_match,
+                prune_matched_dir_subtrees,
                 needs_metadata,
                 timeout_flag,
             );
@@ -2104,6 +2169,7 @@ fn run_standard(
                 &opts_clone,
                 type_flag,
                 false,
+                false,
                 needs_metadata,
                 &timeout_triggered,
             )
@@ -2119,6 +2185,7 @@ fn run_standard(
                     &tx,
                     &opts_clone,
                     type_flag,
+                    false,
                     false,
                     needs_metadata,
                     &timeout_triggered,
@@ -2141,6 +2208,7 @@ fn run_standard(
                         Some(TypeFlag::Dir),
                         false,
                         false,
+                        false,
                         &timeout_triggered,
                     );
                     drop(rtx);
@@ -2157,6 +2225,7 @@ fn run_standard(
                             tx_c,
                             &opts_clone,
                             type_flag,
+                            false,
                             false,
                             needs_metadata,
                             &timeout_triggered,
@@ -2202,14 +2271,22 @@ fn run_contains_all(
     } else {
         None
     };
-    let mut regexes = Vec::new();
+    let mut term_specs: Vec<(String, i64)> = Vec::new();
     for p in &spec.terms {
         let parsed = parse_name_pattern(p, opts.regex_mode);
         if parsed.type_flag == Some(TypeFlag::Dir) && !opts.force_file {
             type_flag = Some(TypeFlag::Dir);
         }
-        regexes.push(parsed.regex);
+        term_specs.push((parsed.regex, term_selectivity_score(p, opts.regex_mode)));
     }
+    term_specs.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            b.0.len()
+                .cmp(&a.0.len())
+                .then_with(|| a.0.cmp(&b.0))
+        })
+    });
+    let regexes: Vec<String> = term_specs.into_iter().map(|(rx, _)| rx).collect();
     if regexes.is_empty() {
         return Ok(Vec::new());
     }
@@ -2231,6 +2308,7 @@ fn run_contains_all(
             &opts_clone,
             type_flag,
             opts_clone.force_full,
+            false,
             needs_metadata,
             &timeout_triggered,
         )
@@ -2254,6 +2332,24 @@ fn run_contains_all(
                     let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
                     re_extra.is_match(base)
                 }
+            })
+            .collect();
+    }
+    if opts.force_full && regexes.len() > 1 {
+        let basename_res: Vec<Regex> = regexes
+            .iter()
+            .map(|rx| {
+                RegexBuilder::new(rx)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|e| format!("Invalid regex: {}", e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        rows = rows
+            .into_iter()
+            .filter(|r| {
+                let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                basename_res.iter().any(|re| re.is_match(base))
             })
             .collect();
     }
@@ -2318,6 +2414,7 @@ fn run_full(
     let (tx, rx) = unbounded::<Vec<SearchResult>>();
     let opts_clone = opts.clone();
     let is_catch_all = regexes[0] == ".*" || regexes[0] == "^.*$";
+    let prune_matched_dir_subtrees = regexes.len() == 1;
     rayon::spawn(move || {
         walk_rayon_worker(
             PathBuf::from(search_root),
@@ -2327,6 +2424,7 @@ fn run_full(
             &opts_clone,
             type_flag,
             true,
+            prune_matched_dir_subtrees,
             opts_clone.long_format || opts_clone.sort_field.is_some() || opts_clone.sizes,
             &timeout_triggered,
         );

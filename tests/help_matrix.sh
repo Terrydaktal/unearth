@@ -39,6 +39,20 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local name="$1"
+  local haystack="$2"
+  local needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "FAIL: ${name}" >&2
+    echo "----- got -----" >&2
+    printf '%s\n' "$haystack" >&2
+    echo "----- unexpected ----" >&2
+    printf '%s\n' "$needle" >&2
+    exit 1
+  fi
+}
+
 assert_regex() {
   local name="$1"
   local text="$2"
@@ -252,6 +266,12 @@ cluster_full_sep="$("$F" --timeout "$F_TIMEOUT" -F -H abc "$FILE_ROOT" 2>/dev/nu
 cluster_full_combined="$("$F" --timeout "$F_TIMEOUT" -FH abc "$FILE_ROOT" 2>/dev/null | sed "s#^${FILE_ROOT}/##" | sort)"
 assert_eq "combined short -FH equals separated -F -H" "$cluster_full_combined" "$cluster_full_sep"
 
+FULL_PRUNE_ROOT="${TMP_BASE}/full_prune_root"
+mkdir -p "${FULL_PRUNE_ROOT}/abc_parent/sub"
+touch "${FULL_PRUNE_ROOT}/abc_parent/sub/abc_child.txt"
+full_prune_out="$(list_rel "$FULL_PRUNE_ROOT" -F abc)"
+assert_eq "full mode prunes children of matched parent dirs" "$full_prune_out" "abc_parent/"
+
 # ABSOLUTE OUTPUT MATRIX
 ABS_ROOT="${TMP_BASE}/abs_root"
 mkdir -p "$ABS_ROOT"
@@ -365,6 +385,8 @@ touch "${CONTENT_ROOT}/relroot/inner/alpha_beta_gamma_hit.txt"
 touch "${CONTENT_ROOT}/relroot/inner/alpha_only_miss.txt"
 mkdir -p "${CONTENT_ROOT}/alpha_beta"
 touch "${CONTENT_ROOT}/alpha_beta/alpha_beta_note.txt"
+mkdir -p "${CONTENT_ROOT}/config_folder/fish_folder"
+touch "${CONTENT_ROOT}/config_folder/fish_folder/index.html"
 
 assert_eq "contains-all names with explicit absolute path arg" "$(list_rel "$CONTENT_ROOT" alpha beta gamma)" "relroot/inner/alpha_beta_gamma_hit.txt"
 assert_eq "contains-all names with implicit relative path arg containing slash" "$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" alpha beta gamma relroot/inner 2>/dev/null | sort)" "relroot/inner/alpha_beta_gamma_hit.txt"
@@ -374,5 +396,7 @@ assert_eq "contains-all names --path enables bare relative folder path" "$(cd "$
 assert_eq "contains-all flag forces name mode for two terms" "$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" --contains-all alpha beta --path folder1 2>/dev/null | sort)" "folder1/alpha_beta_doc.txt"
 contains_full_out="$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" -F alpha beta 2>/dev/null | sort)"
 assert_contains "contains-all -F keeps file under matching directory" "$contains_full_out" "alpha_beta/alpha_beta_note.txt"
+cf_full_out="$(cd "$CONTENT_ROOT" && "$F" --timeout "$F_TIMEOUT" -F config fish 2>/dev/null | sort)"
+assert_not_contains "contains-all -F excludes parent-only term matches in basename" "$cf_full_out" "config_folder/fish_folder/index.html"
 
 echo "PASS: help matrix suite"
