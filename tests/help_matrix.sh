@@ -266,11 +266,20 @@ cluster_full_sep="$("$F" --timeout "$F_TIMEOUT" -F -H abc "$FILE_ROOT" 2>/dev/nu
 cluster_full_combined="$("$F" --timeout "$F_TIMEOUT" -FH abc "$FILE_ROOT" 2>/dev/null | sed "s#^${FILE_ROOT}/##" | sort)"
 assert_eq "combined short -FH equals separated -F -H" "$cluster_full_combined" "$cluster_full_sep"
 
-FULL_PRUNE_ROOT="${TMP_BASE}/full_prune_root"
-mkdir -p "${FULL_PRUNE_ROOT}/abc_parent/sub"
-touch "${FULL_PRUNE_ROOT}/abc_parent/sub/abc_child.txt"
-full_prune_out="$(list_rel "$FULL_PRUNE_ROOT" -F abc)"
-assert_eq "full mode prunes children of matched parent dirs" "$full_prune_out" "abc_parent/"
+FULL_DESC_ROOT="${TMP_BASE}/full_desc_root"
+mkdir -p "${FULL_DESC_ROOT}/abc_parent/sub"
+touch "${FULL_DESC_ROOT}/abc_parent/sub/abc_child.txt"
+full_desc_out="$(list_rel "$FULL_DESC_ROOT" -F abc)"
+assert_contains "full mode keeps matching descendants under matching parent dirs" "$full_desc_out" "abc_parent/sub/abc_child.txt"
+
+FULL_BASENAME_ROOT="${TMP_BASE}/full_basename_root"
+mkdir -p "${FULL_BASENAME_ROOT}/screenshot/deps"
+touch "${FULL_BASENAME_ROOT}/screenshot/deps/libqoi-ec2c782670acca15.rmeta"
+touch "${FULL_BASENAME_ROOT}/deps_screenshot.txt"
+full_basename_out="$(list_rel "$FULL_BASENAME_ROOT" -F screenshot)"
+assert_contains "full mode single-term includes matching dir basename" "$full_basename_out" "screenshot/"
+assert_contains "full mode single-term includes matching file basename" "$full_basename_out" "deps_screenshot.txt"
+assert_not_contains "full mode single-term excludes non-matching descendant basenames" "$full_basename_out" "screenshot/deps/libqoi-ec2c782670acca15.rmeta"
 
 # ABSOLUTE OUTPUT MATRIX
 ABS_ROOT="${TMP_BASE}/abs_root"

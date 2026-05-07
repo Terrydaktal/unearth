@@ -584,6 +584,18 @@ fn parse_name_pattern(raw: &str, regex_mode: bool) -> NamePattern {
     out
 }
 
+fn pattern_prefers_full_path(raw: &str, regex_mode: bool) -> bool {
+    if regex_mode {
+        return true;
+    }
+    let token = if is_wrapped_quote(raw) && raw.len() >= 2 {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    token.contains('/')
+}
+
 fn term_selectivity_score(raw: &str, regex_mode: bool) -> i64 {
     let mut score: i64 = 0;
     let core = if is_wrapped_quote(raw) && raw.len() >= 2 {
@@ -1032,12 +1044,16 @@ fn walk_rayon_worker(
             let is_match = if is_catch_all {
                 true
             } else {
-                let match_target = if full_path_match {
-                    path.to_string_lossy()
+                if full_path_match {
+                    if re.is_match(name_lossy.as_ref()) {
+                        true
+                    } else {
+                        let match_target = path.to_string_lossy();
+                        re.is_match(&match_target)
+                    }
                 } else {
-                    name_lossy.clone()
-                };
-                re.is_match(&match_target)
+                    re.is_match(name_lossy.as_ref())
+                }
             };
             if is_match {
                 let mut p_str = path
@@ -2389,18 +2405,21 @@ fn run_full(
     } else {
         None
     };
-    let mut regexes = Vec::new();
+    let mut pattern_specs: Vec<(String, bool)> = Vec::new();
     for p in &patterns {
         let parsed = parse_name_pattern(p, opts.regex_mode);
         if parsed.type_flag == Some(TypeFlag::Dir) && !opts.force_file {
             type_flag = Some(TypeFlag::Dir);
         }
-        regexes.push(parsed.regex);
+        pattern_specs.push((
+            parsed.regex,
+            pattern_prefers_full_path(p, opts.regex_mode),
+        ));
     }
-    if regexes.is_empty() {
+    if pattern_specs.is_empty() {
         return Ok(Vec::new());
     }
-    let re = RegexBuilder::new(&regexes[0])
+    let re = RegexBuilder::new(&pattern_specs[0].0)
         .case_insensitive(true)
         .build()
         .unwrap();
@@ -2413,8 +2432,9 @@ fn run_full(
     });
     let (tx, rx) = unbounded::<Vec<SearchResult>>();
     let opts_clone = opts.clone();
-    let is_catch_all = regexes[0] == ".*" || regexes[0] == "^.*$";
-    let prune_matched_dir_subtrees = regexes.len() == 1;
+    let is_catch_all = pattern_specs[0].0 == ".*" || pattern_specs[0].0 == "^.*$";
+    let first_full_path_match = pattern_specs[0].1;
+    let prune_matched_dir_subtrees = false;
     rayon::spawn(move || {
         walk_rayon_worker(
             PathBuf::from(search_root),
@@ -2423,7 +2443,7 @@ fn run_full(
             &tx,
             &opts_clone,
             type_flag,
-            true,
+            first_full_path_match,
             prune_matched_dir_subtrees,
             opts_clone.long_format || opts_clone.sort_field.is_some() || opts_clone.sizes,
             &timeout_triggered,
@@ -2433,29 +2453,26 @@ fn run_full(
     for chunk in rx {
         rows.extend(chunk);
     }
-    for rx_str in regexes.iter().skip(1) {
+    for (rx_str, full_path_match) in pattern_specs.iter().skip(1) {
         let re_extra = RegexBuilder::new(rx_str)
             .case_insensitive(true)
             .build()
             .map_err(|e| format!("Invalid regex: {}", e))?;
         rows = rows
             .into_iter()
-            .filter(|r| re_extra.is_match(&r.path))
+            .filter(|r| {
+                if *full_path_match {
+                    re_extra.is_match(&r.path)
+                } else {
+                    let base = r.path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                    re_extra.is_match(base)
+                }
+            })
             .collect();
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut final_rows = Vec::new();
-    let mut last = String::new();
-    for r in rows {
-        let p = r.path.trim_end_matches('/');
-        if !last.is_empty() && p.starts_with(&format!("{}/", last)) {
-            continue;
-        }
-        last = p.to_string();
-        final_rows.push(r);
-    }
     Ok(final_transform(
-        final_rows,
+        rows,
         opts,
         use_style,
         stdout_is_tty,
