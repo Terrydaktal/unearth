@@ -31,6 +31,7 @@ Usage:
                        [--absolute-paths|-A]
                        [--sizes]
                        [--contains-all]
+                       [--highlight-match|--match-red]
                        [--path DIR]
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
@@ -120,6 +121,8 @@ Options:
   --absolute-paths, -A
       Print absolute paths in output (display only). Does not change matching
       behavior.
+  --highlight-match, --match-red
+      Show matched text in red inside output paths.
   --regex, -r
       Treat filename/dirname and search_dir patterns as regular expressions.
   --long, -l

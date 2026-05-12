@@ -92,6 +92,7 @@ struct Options {
     classify: bool,
     color_when: ColorWhen,
     hyperlinks: bool,
+    highlight_match: bool,
     contains_all: bool,
     path_override: Option<String>,
     positional: Vec<String>,
@@ -108,6 +109,12 @@ struct SearchResult {
 struct ContainsAllSpec {
     terms: Vec<String>,
     root: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct HighlightSpec {
+    prefix_rules: Vec<Regex>,
+    leaf_rules: Vec<Regex>,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +163,7 @@ Usage:
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
                        [--color=auto|always|never] [--hyperlink]
+                       [--highlight-match|--match-red]
   unearth (--version|-V)
 
 Arguments:
@@ -214,6 +222,8 @@ Arguments:
    Notes:
   - Use quotes around patterns containing $ or * to prevent shell expansion.
   - Regex mode is only enabled with --regex/-r.
+  - --highlight-match (alias: --match-red) shows matched text in red inside
+    output paths.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
@@ -271,6 +281,7 @@ fn parse_args() -> Result<Options, String> {
         classify: false,
         color_when: ColorWhen::Auto,
         hyperlinks: false,
+        highlight_match: false,
         contains_all: false,
         path_override: None,
         positional: Vec::new(),
@@ -393,6 +404,7 @@ fn parse_args() -> Result<Options, String> {
                 opts.color_when = parse_color_when(arg.trim_start_matches("--color="))?;
             }
             "--hyperlink" => opts.hyperlinks = true,
+            "--highlight-match" | "--match-red" => opts.highlight_match = true,
             "--contains-all" => opts.contains_all = true,
             "--path" => {
                 i += 1;
@@ -493,6 +505,7 @@ fn can_stream_direct(opts: &Options, use_style: bool) -> bool {
     !use_style
         && !opts.classify
         && !opts.force_full
+        && !opts.highlight_match
         && !opts.counts
         && opts.sort_field.is_none()
         && !opts.long_format
@@ -1715,6 +1728,7 @@ fn add_info_transform(
     use_style: bool,
     add_decorator: bool,
     colors: &ColorSpec,
+    highlight: Option<&HighlightSpec>,
 ) -> Vec<String> {
     if !opts.long_format {
         return items.into_iter().map(|i| i.path).collect();
@@ -1743,7 +1757,14 @@ fn add_info_transform(
                     }
                 }
             }
-            let path_display = render_styled_path(&item, use_style, add_decorator, colors, opts);
+            let path_display = render_styled_path(
+                &item,
+                use_style,
+                add_decorator,
+                colors,
+                opts,
+                highlight,
+            );
             out.push(format!(
                 "{} {}{} {}",
                 dt_str, human_size, extra, path_display
@@ -1762,12 +1783,20 @@ fn sizes_transform(
     use_style: bool,
     add_decorator: bool,
     colors: &ColorSpec,
+    highlight: Option<&HighlightSpec>,
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let bytes = size_bytes_for_result(&item, opts, cache);
         let compact = format_size_compact_3(bytes);
-        let path_display = render_styled_path(&item, use_style, add_decorator, colors, opts);
+        let path_display = render_styled_path(
+            &item,
+            use_style,
+            add_decorator,
+            colors,
+            opts,
+            highlight,
+        );
         out.push(format!("{}\t{}", compact, path_display));
     }
     out
@@ -1922,12 +1951,104 @@ fn decorator_for_res(res: &SearchResult) -> Option<char> {
     None
 }
 
+const MATCH_HIGHLIGHT_CODE: &str = "1;91";
+
+fn compile_highlight_spec(patterns: &[(String, bool)]) -> Result<HighlightSpec, String> {
+    let mut prefix_rules = Vec::new();
+    let mut leaf_rules = Vec::new();
+    for (raw, full_path_match) in patterns {
+        let re = RegexBuilder::new(raw)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| format!("Invalid regex: {}", e))?;
+        if *full_path_match {
+            prefix_rules.push(re.clone());
+        }
+        leaf_rules.push(re);
+    }
+    Ok(HighlightSpec {
+        prefix_rules,
+        leaf_rules,
+    })
+}
+
+fn merge_match_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut current = ranges[0];
+    for (start, end) in ranges.into_iter().skip(1) {
+        if start <= current.1 {
+            current.1 = current.1.max(end);
+        } else {
+            merged.push(current);
+            current = (start, end);
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+fn colorize_segment_with_highlights(
+    text: &str,
+    base_code: Option<&str>,
+    rules: &[Regex],
+) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut ranges = Vec::new();
+    for re in rules {
+        for m in re.find_iter(text) {
+            ranges.push((m.start(), m.end()));
+        }
+    }
+    let ranges = merge_match_ranges(ranges);
+    if ranges.is_empty() {
+        return match base_code {
+            Some(code) => format!("\x1b[{}m{}\x1b[0m", code, text),
+            None => text.to_string(),
+        };
+    }
+    let mut out = String::with_capacity(text.len() + ranges.len() * 16);
+    if let Some(code) = base_code {
+        out.push_str("\x1b[");
+        out.push_str(code);
+        out.push('m');
+    }
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if start > cursor {
+            out.push_str(&text[cursor..start]);
+        }
+        out.push_str("\x1b[");
+        out.push_str(MATCH_HIGHLIGHT_CODE);
+        out.push('m');
+        out.push_str(&text[start..end]);
+        out.push_str("\x1b[0m");
+        if let Some(code) = base_code {
+            out.push_str("\x1b[");
+            out.push_str(code);
+            out.push('m');
+        }
+        cursor = end;
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
 fn render_styled_path(
     res: &SearchResult,
     use_style: bool,
     add_decorator: bool,
     colors: &ColorSpec,
     opts: &Options,
+    highlight: Option<&HighlightSpec>,
 ) -> String {
     let mut display_path = res.path.clone();
     if add_decorator {
@@ -1936,9 +2057,6 @@ fn render_styled_path(
                 display_path.push(d);
             }
         }
-    }
-    if !use_style {
-        return display_path;
     }
     let (prefix, leaf) = if display_path.ends_with('/') {
         let core = display_path.trim_end_matches('/');
@@ -1952,16 +2070,51 @@ fn render_styled_path(
     } else {
         (String::new(), display_path.clone())
     };
+    if !use_style {
+        if let Some(spec) = highlight {
+            let mut plain = String::new();
+            if !prefix.is_empty() {
+                plain.push_str(&colorize_segment_with_highlights(
+                    &prefix,
+                    None,
+                    &spec.prefix_rules,
+                ));
+            }
+            plain.push_str(&colorize_segment_with_highlights(&leaf, None, &spec.leaf_rules));
+            return plain;
+        }
+        return display_path;
+    }
     let leaf_code = color_code_for_path(res, colors);
-    let leaf_colored = if leaf_code.is_empty() {
+    let leaf_colored = if let Some(spec) = highlight {
+        colorize_segment_with_highlights(
+            &leaf,
+            if leaf_code.is_empty() {
+                None
+            } else {
+                Some(leaf_code.as_str())
+            },
+            &spec.leaf_rules,
+        )
+    } else if leaf_code.is_empty() {
         leaf.clone()
     } else {
         format!("\x1b[{}m{}\x1b[0m", leaf_code, leaf)
     };
+    let prefix_colored = if prefix.is_empty() {
+        String::new()
+    } else if let Some(spec) = highlight {
+        colorize_segment_with_highlights(
+            &prefix,
+            Some(colors.color_prefix_dir.as_str()),
+            &spec.prefix_rules,
+        )
+    } else {
+        format!("\x1b[{}m{}\x1b[0m", colors.color_prefix_dir, prefix)
+    };
     let mut final_str = if prefix.is_empty() {
         leaf_colored.clone()
     } else {
-        let prefix_colored = format!("\x1b[{}m{}\x1b[0m", colors.color_prefix_dir, prefix);
         format!("{}{}", prefix_colored, leaf_colored)
     };
     if opts.hyperlinks {
@@ -1983,7 +2136,6 @@ fn render_styled_path(
                 abs_leaf, final_str
             );
         } else {
-            let prefix_colored = format!("\x1b[{}m{}\x1b[0m", colors.color_prefix_dir, prefix);
             final_str = format!(
                 "\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\\x1b]8;;file://{}\x1b\\{}\x1b]8;;\x1b\\",
                 abs_prefix, prefix_colored, abs_leaf, leaf_colored
@@ -2000,6 +2152,7 @@ fn final_transform(
     stdout_is_tty: bool,
     colors: &ColorSpec,
     cache: &mut DirStatsCache,
+    highlight: Option<&HighlightSpec>,
 ) -> Vec<String> {
     let items = absolute_paths_transform(items, opts);
     cache_transform(&items, opts);
@@ -2010,11 +2163,19 @@ fn final_transform(
     precompute_dirsize_cache(&items, opts, cache);
     let items = sort_results(items, opts, cache);
     if opts.sizes {
-        return sizes_transform(items, opts, cache, use_style, add_decorators, colors);
+        return sizes_transform(items, opts, cache, use_style, add_decorators, colors, highlight);
     }
     let mut out = Vec::new();
     if opts.long_format {
-        for item_str in add_info_transform(items, opts, cache, use_style, add_decorators, colors) {
+        for item_str in add_info_transform(
+            items,
+            opts,
+            cache,
+            use_style,
+            add_decorators,
+            colors,
+            highlight,
+        ) {
             out.push(item_str);
         }
     } else {
@@ -2025,6 +2186,7 @@ fn final_transform(
                 add_decorators,
                 colors,
                 opts,
+                highlight,
             ));
         }
     }
@@ -2254,6 +2416,11 @@ fn run_standard(
     for chunk in rx {
         results.extend(chunk);
     }
+    let highlight_spec = if opts.highlight_match {
+        Some(compile_highlight_spec(&[(name.regex.clone(), false)])?)
+    } else {
+        None
+    };
     Ok(final_transform(
         results,
         opts,
@@ -2261,6 +2428,7 @@ fn run_standard(
         stdout_is_tty,
         colors,
         cache,
+        highlight_spec.as_ref(),
     ))
 }
 
@@ -2370,6 +2538,16 @@ fn run_contains_all(
             .collect();
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
+    let highlight_spec = if opts.highlight_match {
+        let highlight_patterns: Vec<(String, bool)> = regexes
+            .iter()
+            .cloned()
+            .map(|rx| (rx, opts.force_full))
+            .collect();
+        Some(compile_highlight_spec(&highlight_patterns)?)
+    } else {
+        None
+    };
 
     Ok(final_transform(
         rows,
@@ -2378,6 +2556,7 @@ fn run_contains_all(
         stdout_is_tty,
         colors,
         cache,
+        highlight_spec.as_ref(),
     ))
 }
 
@@ -2471,6 +2650,11 @@ fn run_full(
             .collect();
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
+    let highlight_spec = if opts.highlight_match {
+        Some(compile_highlight_spec(&pattern_specs)?)
+    } else {
+        None
+    };
     Ok(final_transform(
         rows,
         opts,
@@ -2478,6 +2662,7 @@ fn run_full(
         stdout_is_tty,
         colors,
         cache,
+        highlight_spec.as_ref(),
     ))
 }
 

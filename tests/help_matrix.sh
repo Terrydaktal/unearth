@@ -281,6 +281,13 @@ assert_contains "full mode single-term includes matching dir basename" "$full_ba
 assert_contains "full mode single-term includes matching file basename" "$full_basename_out" "deps_screenshot.txt"
 assert_not_contains "full mode single-term excludes non-matching descendant basenames" "$full_basename_out" "screenshot/deps/libqoi-ec2c782670acca15.rmeta"
 
+# HIGHLIGHT MATRIX
+HIGHLIGHT_ROOT="${TMP_BASE}/highlight_root"
+mkdir -p "$HIGHLIGHT_ROOT"
+touch "${HIGHLIGHT_ROOT}/screenshot.txt"
+highlight_out="$("$F" --timeout "$F_TIMEOUT" --color=never --highlight-match screenshot "$HIGHLIGHT_ROOT" 2>/dev/null)"
+assert_contains "highlight flag wraps matched text in bold bright red" "$highlight_out" $'\033[1;91mscreenshot\033[0m'
+
 # ABSOLUTE OUTPUT MATRIX
 ABS_ROOT="${TMP_BASE}/abs_root"
 mkdir -p "$ABS_ROOT"
