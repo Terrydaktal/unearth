@@ -308,6 +308,20 @@ assert_eq "classify default off on non-tty" "$classify_default" "link_file"
 assert_eq "classify enabled by -C" "$classify_forced" "link_file@"
 assert_eq "classify enabled by combined -Cf" "$classify_combined" "link_file@"
 
+# COUNTS MATRIX
+COUNTS_ROOT="${TMP_BASE}/counts_root"
+mkdir -p "${COUNTS_ROOT}/a" "${COUNTS_ROOT}/b" "${COUNTS_ROOT}/c"
+touch "${COUNTS_ROOT}/a/hit1" "${COUNTS_ROOT}/a/hit2"
+touch "${COUNTS_ROOT}/b/hit1" "${COUNTS_ROOT}/b/hit2" "${COUNTS_ROOT}/b/hit3"
+touch "${COUNTS_ROOT}/c/hit1"
+counts_out="$("$F" --timeout "$F_TIMEOUT" hit "$COUNTS_ROOT" --counts --color=never 2>/dev/null | awk '{print $1 "\t" $2}')"
+want_counts_out=$'1\t'"${COUNTS_ROOT}/c"$'\n2\t'"${COUNTS_ROOT}/a"$'\n3\t'"${COUNTS_ROOT}/b"
+assert_eq "counts default sort is ascending by count then folder" "$counts_out" "$want_counts_out"
+counts_color_out="$("$F" --timeout "$F_TIMEOUT" hit "$COUNTS_ROOT" --counts --color=always 2>/dev/null)"
+assert_contains "counts output colors folder column when requested" "$counts_color_out" $'\033['
+counts_link_out="$("$F" --timeout "$F_TIMEOUT" hit "$COUNTS_ROOT" --counts --color=always --hyperlink 2>/dev/null)"
+assert_contains "counts output hyperlinks folder column when requested" "$counts_link_out" $'\033]8;;file://'
+
 threads_err="$("$F" --timeout "$F_TIMEOUT" --threads 0 abc "$NONREC_ROOT" 2>&1 >/dev/null || true)"
 assert_contains "threads invalid value errors" "$threads_err" "--threads requires a positive integer"
 

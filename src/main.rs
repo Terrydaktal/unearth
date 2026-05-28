@@ -22,6 +22,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 const VERSION: &str = "0.8.6";
 const NTFS_FS_TYPES: [&str; 3] = ["ntfs", "ntfs3", "fuseblk"];
+const ROOT_SIZE_SKIP_TREES: [&str; 6] = ["/mnt", "/media", "/dev", "/proc", "/sys", "/run"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TypeFlag {
@@ -156,6 +157,8 @@ Usage:
                        [--dir|-d] [--file|-f] [--regex|-r] [--bypass|-b]
                        [--classify|-C]
                        [--absolute-paths|-A]
+                       [--counts]
+                       [--long|-l] [--long-true-dirsize|-L]
                        [--sizes]
                        [--contains-all]
                        [--path DIR]
@@ -212,21 +215,22 @@ Arguments:
 
    The --full flag matches against the full absolute path instead of just
    the basename.
-   It supports multiple patterns (implicit AND) and prunes redundant
-   child results.
 
-   Example: unearth --full "src" "main"   # Matches BOTH (hides children)
-   Example: unearth --full "test"         # Returns /path/to/test, but hides
-   /path/to/test/file
+   Example: unearth --full "src" "main"   # Matches BOTH
+   Example: unearth --full "test"         # Matches any full path containing "test"
 
    Notes:
   - Use quotes around patterns containing $ or * to prevent shell expansion.
   - Regex mode is only enabled with --regex/-r.
   - --highlight-match (alias: --match-red) shows matched text in red inside
     output paths.
+  - --counts prints match counts grouped by parent folder.
+    This mode outputs summary rows instead of full match paths.
   - --sizes prints compact sizes as SIZE<TAB>PATH (max 6 chars including
     unit, e.g., 1.111M, 111.1M),
     using recursive directory totals for directory matches.
+    For top-level system trees under / (/mnt, /media, /dev, /proc, /sys, /run),
+    size is shown as '-' to avoid expensive recursive traversal.
   - Name contains-all mode is implicit with 2+ plain positional terms
     (legacy name+search_dir selector forms still use search_dir mode),
     or enabled by --contains-all:
@@ -424,6 +428,7 @@ fn parse_args() -> Result<Options, String> {
             "--dir" | "-d" => opts.force_dir = true,
             "--file" | "-f" => opts.force_file = true,
             "--full" | "-F" => opts.force_full = true,
+            "--counts" => opts.counts = true,
             "--classify" | "-C" => opts.classify = true,
             "--absolute-paths" | "-A" => opts.absolute_paths = true,
             "--regex" | "-r" => opts.regex_mode = true,
@@ -1445,6 +1450,13 @@ fn normalize_dir_key(path: &str) -> String {
     }
 }
 
+fn should_skip_root_size_tree(path: &str) -> bool {
+    let normalized = normalize_dir_key(path);
+    ROOT_SIZE_SKIP_TREES
+        .iter()
+        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{}/", prefix)))
+}
+
 fn format_size_iec(bytes: u64) -> String {
     let units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut unit = 0usize;
@@ -1499,6 +1511,9 @@ fn should_use_recursive_dirsize(item: &SearchResult, opts: &Options) -> bool {
 
 fn size_bytes_for_result(item: &SearchResult, opts: &Options, cache: &mut DirStatsCache) -> u64 {
     if should_use_recursive_dirsize(item, opts) {
+        if should_skip_root_size_tree(&item.path) {
+            return 0;
+        }
         return get_dirsize_bytes(&item.path, cache).unwrap_or(0);
     }
     item.metadata.as_ref().map(|m| m.len()).unwrap_or(0)
@@ -1520,11 +1535,17 @@ fn precompute_dirsize_cache(items: &[SearchResult], opts: &Options, cache: &mut 
     needed_dirs.dedup();
     if opts.long_extended {
         for dir in needed_dirs {
+            if should_skip_root_size_tree(&dir) {
+                continue;
+            }
             let _ = get_dirsize_stats(&dir, cache);
         }
     } else {
         let mut missing = Vec::new();
         for dir in needed_dirs {
+            if should_skip_root_size_tree(&dir) {
+                continue;
+            }
             if !cache.bytes_map.contains_key(&dir) && !cache.map.contains_key(&dir) {
                 missing.push(dir);
             }
@@ -1787,8 +1808,12 @@ fn sizes_transform(
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let bytes = size_bytes_for_result(&item, opts, cache);
-        let compact = format_size_compact_3(bytes);
+        let compact = if should_skip_root_size_tree(&item.path) {
+            "-".to_string()
+        } else {
+            let bytes = size_bytes_for_result(&item, opts, cache);
+            format_size_compact_3(bytes)
+        };
         let path_display = render_styled_path(
             &item,
             use_style,
@@ -1802,7 +1827,14 @@ fn sizes_transform(
     out
 }
 
-fn counts_summary_transform(items: Vec<SearchResult>, is_tty: bool) -> Vec<String> {
+fn counts_summary_transform(
+    items: Vec<SearchResult>,
+    show_header: bool,
+    use_style: bool,
+    colors: &ColorSpec,
+    opts: &Options,
+    highlight: Option<&HighlightSpec>,
+) -> Vec<String> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     for item in items {
         let mut p = item.path.trim_end_matches('/').to_string();
@@ -1819,13 +1851,27 @@ fn counts_summary_transform(items: Vec<SearchResult>, is_tty: bool) -> Vec<Strin
         *counts.entry(d).or_insert(0) += 1;
     }
     let mut rows: Vec<(String, u64)> = counts.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    rows.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     let mut out = Vec::new();
-    if is_tty {
+    if show_header {
         out.push(format!("{:>7}  {}", "COUNT", "FOLDER"));
     }
     for (folder, n) in rows {
-        out.push(format!("{:>7}  {}", n, folder));
+        let folder_item = SearchResult {
+            path: folder,
+            is_dir: true,
+            is_symlink: false,
+            metadata: None,
+        };
+        let folder_display = render_styled_path(
+            &folder_item,
+            use_style,
+            false,
+            colors,
+            opts,
+            highlight,
+        );
+        out.push(format!("{:>7}  {}", n, folder_display));
     }
     out
 }
@@ -2158,7 +2204,14 @@ fn final_transform(
     cache_transform(&items, opts);
     let add_decorators = stdout_is_tty || opts.classify;
     if opts.counts {
-        return counts_summary_transform(items, use_style);
+        return counts_summary_transform(
+            items,
+            stdout_is_tty,
+            use_style,
+            colors,
+            opts,
+            highlight,
+        );
     }
     precompute_dirsize_cache(&items, opts, cache);
     let items = sort_results(items, opts, cache);

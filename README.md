@@ -29,6 +29,8 @@ Usage:
                        [--dir|-d] [--file|-f] [--regex|-r] [--bypass|-b]
                        [--classify|-C]
                        [--absolute-paths|-A]
+                       [--counts]
+                       [--long|-l] [--long-true-dirsize|-L]
                        [--sizes]
                        [--contains-all]
                        [--highlight-match|--match-red]
@@ -36,6 +38,7 @@ Usage:
                        [--timeout N] [--sort date|size|name asc|desc]
                        [--no-recurse|-R] [--follow-links]
                        [--ignore] [--hidden|-H] [--threads N] [--cache-raw]
+                       [--color=auto|always|never] [--hyperlink]
   unearth (--version|-V)
 
 Arguments:
@@ -133,6 +136,9 @@ Options:
       for matching directories as: SIZE<TAB>PATH.
       Units are B/K/M/G/T, capped to 6 characters including the unit
       (for example 1.111M, 111.1M).
+      For top-level system trees under `/` (`/mnt`, `/media`, `/dev`,
+      `/proc`, `/sys`, `/run`), size is shown as `-` to avoid expensive
+      recursive traversal.
       Recursive directory totals prefer an NTFS MFT fast path on ntfs/ntfs3/
       fuseblk and fall back to jwalk automatically when unavailable.
       Set UNEARTH_NTFS_DEBUG=1 to print fast-path status.
@@ -154,7 +160,8 @@ Options:
       --sort date asc|desc, --sort size asc|desc, --sort name asc|desc
       For directories, size sort uses real allocated directory size.
       With --no-recurse/-R, size sort uses direct entry size for speed.
-      Note: --counts output is always sorted by count/folder and ignores --sort.
+      Note: --counts output is always sorted ascending by count, then folder,
+      and ignores --sort.
   --no-recurse, -R
       Search only the immediate entries in each search root (no recursion).
   --follow-links
